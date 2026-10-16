@@ -113,6 +113,7 @@ class StreamResult:
     elapsed_s: float = 0.0
     first_token_s: float | None = None
     tools_unsupported: bool = False
+    aborted: bool = False
 
 
 ReasoningCb = Callable[[str], None] | None
@@ -169,6 +170,7 @@ class LlmClient:
         cfg: Config,
         on_reasoning: ReasoningCb = None,
         on_content: ReasoningCb = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> StreamResult:
         base_kwargs: dict[str, Any] = dict(
             model=self.model,
@@ -200,14 +202,16 @@ class LlmClient:
                 if has_tools and "tool" in msg:
                     base_kwargs.pop("tools", None)
                     base_kwargs.pop("tool_choice", None)
-                    res = self.stream_chat(messages, None, cfg, on_reasoning, on_content)
+                    res = self.stream_chat(
+                        messages, None, cfg, on_reasoning, on_content, should_abort
+                    )
                     res.tools_unsupported = True
                     return res
                 return StreamResult(ok=False, error=f"{type(e).__name__}: {e}")
             except Exception as e:  # noqa: BLE001
                 return StreamResult(ok=False, error=f"{type(e).__name__}: {e}")
             try:
-                return self._consume(stream, on_reasoning, on_content)
+                return self._consume(stream, on_reasoning, on_content, should_abort)
             except Exception as e:  # noqa: BLE001
                 return StreamResult(
                     ok=False, error=f"stream interrupted: {type(e).__name__}: {e}"
@@ -219,6 +223,7 @@ class LlmClient:
         stream,
         on_reasoning: ReasoningCb,
         on_content: ReasoningCb,
+        should_abort: Callable[[], bool] | None = None,
     ) -> StreamResult:
         def _cb(cb: ReasoningCb, text: str) -> None:
             if cb is None or not text:
@@ -235,59 +240,69 @@ class LlmClient:
         usage: dict[str, Any] | None = None
         t0 = time.monotonic()
         t_first: float | None = None
+        aborted = False
 
-        for chunk in stream:
-            u = getattr(chunk, "usage", None)
-            if u is not None:
-                usage = u if isinstance(u, dict) else u.model_dump()
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            if delta is None:
-                continue
+        try:
+            for chunk in stream:
+                if should_abort is not None and should_abort():
+                    aborted = True
+                    break
+                u = getattr(chunk, "usage", None)
+                if u is not None:
+                    usage = u if isinstance(u, dict) else u.model_dump()
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
 
-            rc = getattr(delta, "reasoning_content", None)
-            if not rc:
-                extra = getattr(delta, "model_extra", None) or {}
-                rc = extra.get("reasoning_content") or extra.get("reasoning") or ""
+                rc = getattr(delta, "reasoning_content", None)
+                if not rc:
+                    extra = getattr(delta, "model_extra", None) or {}
+                    rc = extra.get("reasoning_content") or extra.get("reasoning") or ""
 
-            for tc in getattr(delta, "tool_calls", None) or []:
-                idx = getattr(tc, "index", 0) or 0
-                slot = slots.get(idx)
-                if slot is None:
-                    slot = ToolCall(id="", name="", arguments="")
-                    slots[idx] = slot
-                if getattr(tc, "id", None):
-                    slot.id = tc.id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    fname = getattr(fn, "name", None)
-                    if fname:
-                        if slot.name and fname.startswith(slot.name):
-                            slot.name = fname          # full name repeated / extension
-                        else:
-                            slot.name += fname         # name streamed in pieces
-                    if getattr(fn, "arguments", None):
-                        slot.arguments += fn.arguments
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    idx = getattr(tc, "index", 0) or 0
+                    slot = slots.get(idx)
+                    if slot is None:
+                        slot = ToolCall(id="", name="", arguments="")
+                        slots[idx] = slot
+                    if getattr(tc, "id", None):
+                        slot.id = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        fname = getattr(fn, "name", None)
+                        if fname:
+                            if slot.name and fname.startswith(slot.name):
+                                slot.name = fname          # full name repeated / extension
+                            else:
+                                slot.name += fname         # name streamed in pieces
+                        if getattr(fn, "arguments", None):
+                            slot.arguments += fn.arguments
 
-            if rc:
-                if t_first is None:
-                    t_first = time.monotonic() - t0
-                reasoning_parts.append(rc)
-                _cb(on_reasoning, rc)
+                if rc:
+                    if t_first is None:
+                        t_first = time.monotonic() - t0
+                    reasoning_parts.append(rc)
+                    _cb(on_reasoning, rc)
 
-            c = getattr(delta, "content", None)
-            if c:
-                if t_first is None:
-                    t_first = time.monotonic() - t0
-                r_out, c_out = splitter.feed(c)
-                if r_out:
-                    reasoning_parts.append(r_out)
-                    _cb(on_reasoning, r_out)
-                if c_out:
-                    content_parts.append(c_out)
-                    _cb(on_content, c_out)
+                c = getattr(delta, "content", None)
+                if c:
+                    if t_first is None:
+                        t_first = time.monotonic() - t0
+                    r_out, c_out = splitter.feed(c)
+                    if r_out:
+                        reasoning_parts.append(r_out)
+                        _cb(on_reasoning, r_out)
+                    if c_out:
+                        content_parts.append(c_out)
+                        _cb(on_content, c_out)
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
 
         r_tail, c_tail = splitter.flush()
         if r_tail:
@@ -310,4 +325,5 @@ class LlmClient:
             usage=usage,
             elapsed_s=time.monotonic() - t0,
             first_token_s=t_first,
+            aborted=aborted,
         )

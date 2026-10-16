@@ -43,6 +43,37 @@ class AgentQuit(Exception):
     pass
 
 
+def system_prompt(cfg: Config) -> str:
+    return SYSTEM_PROMPT.format(
+        os_name=platform.system(),
+        platform=platform.platform(terse=True),
+        workspace=str(cfg.resolved_workspace()),
+        date=time.strftime("%Y-%m-%d"),
+    )
+
+
+def trim_messages(messages: list[dict], budget: int) -> bool:
+    """Drop the oldest turns until the char budget fits. Returns True if anything was dropped."""
+
+    def total() -> int:
+        n = 0
+        for m in messages:
+            n += len(str(m.get("content") or ""))
+            n += len(str(m.get("tool_calls") or ""))
+        return n
+
+    trimmed = False
+    while total() > budget and len(messages) > 2:
+        dropped = messages.pop(1)
+        if dropped.get("tool_calls"):
+            while len(messages) > 1 and messages[1].get("role") == "tool":
+                messages.pop(1)
+        if len(messages) > 1 and messages[1].get("role") == "tool":
+            messages.pop(1)
+        trimmed = True
+    return trimmed
+
+
 class Agent:
     def __init__(self, cfg: Config, console: Console, client: LlmClient, session: Session) -> None:
         self.cfg = cfg
@@ -56,12 +87,7 @@ class Agent:
 
     # ------------------------------------------------------------------ setup
     def _system_prompt(self) -> str:
-        return SYSTEM_PROMPT.format(
-            os_name=platform.system(),
-            platform=platform.platform(terse=True),
-            workspace=str(self.cfg.resolved_workspace()),
-            date=time.strftime("%Y-%m-%d"),
-        )
+        return system_prompt(self.cfg)
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self._system_prompt()}]
@@ -230,25 +256,7 @@ class Agent:
 
     # ---------------------------------------------------------- context trim
     def _trim(self) -> None:
-        budget = self.cfg.context_budget_chars
-
-        def total() -> int:
-            n = 0
-            for m in self.messages:
-                n += len(str(m.get("content") or ""))
-                n += len(str(m.get("tool_calls") or ""))
-            return n
-
-        trimmed = False
-        while total() > budget and len(self.messages) > 2:
-            dropped = self.messages.pop(1)
-            if dropped.get("tool_calls"):
-                while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                    self.messages.pop(1)
-            if len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                self.messages.pop(1)
-            trimmed = True
-        if trimmed:
+        if trim_messages(self.messages, self.cfg.context_budget_chars):
             self.console.print("[dim]· context trimmed to fit budget[/dim]")
 
 

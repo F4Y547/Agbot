@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -40,6 +41,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--env", help="Path to a .env file (default: repo root .env)")
     p.add_argument("--resume", action="store_true", help="Resume the most recent session's history")
     p.add_argument("--selftest", action="store_true", help="Run a scripted tool-call smoke test and exit")
+    p.add_argument(
+        "--tui",
+        action="store_true",
+        help="Force the full-screen TUI (auto-enabled when run in an interactive terminal)",
+    )
+    p.add_argument("--classic", action="store_true", help="Force the classic line-based REPL")
     return p.parse_args(argv)
 
 
@@ -231,6 +238,36 @@ def main(argv: list[str] | None = None) -> int:
     client, is_ollama = resolve_target(cfg, console)
     if args.selftest:
         return run_selftest(cfg, client, console)
+
+    if args.prompt is None:
+        # interactive session: prefer the full-screen TUI (like opencode)
+        ui = os.getenv("AGBOT_UI", "auto").strip().lower()
+        if args.tui:
+            use_tui = True
+        elif args.classic:
+            use_tui = False
+        elif ui == "tui":
+            use_tui = True
+        elif ui == "classic":
+            use_tui = False
+        else:
+            use_tui = sys.stdout.isatty() and sys.stdin.isatty()
+        if use_tui:
+            try:
+                from .tui import AgbotApp
+            except ImportError as e:  # noqa: BLE001
+                console.print(
+                    f"[yellow]TUI unavailable ({e}); using the classic REPL. "
+                    "Install it with: pip install textual[/yellow]"
+                )
+            else:
+                prior: list[dict] = []
+                if args.resume:
+                    latest = latest_session_file(cfg.resolved_session_dir())
+                    if latest:
+                        prior = load_messages(latest)
+                AgbotApp(cfg, client, is_ollama, prior).run()
+                return 0
 
     banner(cfg, client, is_ollama, console)
     if args.prompt:

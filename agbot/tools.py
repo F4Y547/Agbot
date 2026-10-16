@@ -5,7 +5,9 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
+from typing import Callable
 
 TOOL_SCHEMAS: list[dict] = [
     {
@@ -117,9 +119,15 @@ def _truncate(text: str, limit: int = _MAX_OUTPUT) -> str:
 
 
 class ToolRunner:
-    def __init__(self, workspace: Path, shell: str = "") -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        shell: str = "",
+        abort_check: Callable[[], bool] | None = None,
+    ) -> None:
         self.workspace = Path(workspace)
         self.shell = shell
+        self.abort_check = abort_check
 
     # ------------------------------------------------------------------ utils
     def _resolve(self, p: str) -> Path:
@@ -225,20 +233,32 @@ class ToolRunner:
             argv = ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
         else:
             argv = ["/bin/bash", "-lc", command]
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(self.workspace),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            return f"ERROR: command timed out after {timeout}s"
-        out = proc.stdout or ""
-        err = proc.stderr or ""
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(self.workspace),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        deadline = time.monotonic() + timeout
+        out = err = ""
+        while True:
+            try:
+                out, err = proc.communicate(timeout=0.2)  # drains pipes, avoids deadlocks
+                break
+            except subprocess.TimeoutExpired:
+                if self.abort_check is not None and self.abort_check():
+                    proc.kill()
+                    proc.communicate()
+                    return "ERROR: command aborted by user"
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.communicate()
+                    return f"ERROR: command timed out after {timeout}s"
+        out = out or ""
+        err = err or ""
         parts = [f"exit code: {proc.returncode}"]
         if out.strip():
             parts.append(f"stdout:\n{out}")
