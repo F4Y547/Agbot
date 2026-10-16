@@ -1,0 +1,87 @@
+# Deploy stack for dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8 on a 4xH200 box.
+#
+#   cp .env.example .env   # fill in HF_TOKEN
+#   docker compose up -d
+#
+# Ports:
+#   30000  SGLang           (bound to localhost only)
+#   30001  effort-proxy     (the door clients use; SSH-tunnel it, don't expose it)
+name: agbot-model
+
+services:
+  sglang:
+    image: lmsysorg/sglang:dev-dsv41
+    container_name: agbot-sglang
+    command: >
+      sglang serve
+      --model-path ${MODEL_ID:-dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8}
+      --tp-size ${TP_SIZE:-4}
+      --ep-size ${EP_SIZE:-4}
+      --host 0.0.0.0
+      --port 30000
+      --context-length ${CONTEXT_LENGTH:-262144}
+      --mem-fraction-static ${MEM_FRACTION_STATIC:-0.85}
+      --max-running-requests ${MAX_RUNNING_REQUESTS:-12}
+      --cuda-graph-max-bs-decode ${MAX_RUNNING_REQUESTS:-12}
+      --chunked-prefill-size 4096
+      --served-model-name ${SERVED_MODEL_NAME:-deepseek-v4.1-flash-crack}
+      --reasoning-parser deepseek-v41
+      --tool-call-parser deepseekv41
+      --trust-remote-code
+    environment:
+      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN in deploy/.env}
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      # Move the 203 GB Engram tables to host RAM. Needs ~200 GB+ free host RAM;
+      # set to 0 on a 4-GPU box with less than ~1 TB system RAM.
+      SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE: ${ENGRAM_HOST_TABLE:-1}
+      SGLANG_RAGGED_VERIFY_MODE: cap-accept
+      SGLANG_DEFAULT_THINKING: "true"
+      SGLANG_DSV41_REASONING_EFFORT: ${SERVER_REASONING_EFFORT:-max}
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    ipc: host
+    shm_size: 32g
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      # Optional DSpark SPS profile table (only if you enable --speculative-algorithm DSPARK below):
+      # - ./dspark_sps.json:/dspark/dspark_sps.json:ro
+    ports:
+      - "127.0.0.1:30000:30000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45m          # cold start is ~28 min (weight load + JIT)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Injects reasoning_effort into /v1/chat/completions requests that omit it, so the
+  # deepseek-v41 reasoning parser always splits reasoning_content / content cleanly.
+  effort-proxy:
+    image: python:3.12-slim
+    container_name: agbot-effort-proxy
+    depends_on:
+      - sglang
+    command: >
+      sh -c "pip install --quiet --no-cache-dir aiohttp &&
+             exec python /app/effort_proxy.py
+             --listen 0.0.0.0:30001
+             --upstream http://sglang:30000
+             --effort ${PROXY_EFFORT:-max}"
+    volumes:
+      - ./effort_proxy.py:/app/effort_proxy.py:ro
+    ports:
+      - "${PROXY_BIND:-127.0.0.1}:30001:30001"
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

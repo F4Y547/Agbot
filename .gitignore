@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+sessions/
+deploy/.env
+deploy/dspark_sps.json
+.idea/
+.vscode/
