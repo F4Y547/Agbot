@@ -28,13 +28,13 @@ over an SSH tunnel, degrading to a small local Ollama model when the box is off.
 ```powershell
 powershell -ExecutionPolicy Bypass -File dev\setup.ps1   # venv + deps + qwen3:8b
 powershell -ExecutionPolicy Bypass -File dev\smoke.ps1   # verifies the tool loop
-.\.venv\Scripts\python.exe -m agbot                      # interactive agent
+.\run.cmd                                                # interactive agent
 ```
 
 One-shot example:
 
 ```powershell
-.\.venv\Scripts\python.exe -m agbot --yolo "Read requirements.txt and summarize which packages this project needs"
+.\run.cmd --yolo "Read requirements.txt and summarize which packages this project needs"
 ```
 
 ## When the GPU box is up
